@@ -1,0 +1,556 @@
+diff -rupNEZbB original/usr/src/minix/include/minix/callnr.h solution/usr/src/minix/include/minix/callnr.h
+--- original/usr/src/minix/include/minix/callnr.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/include/minix/callnr.h	2023-06-13 19:54:35.308397795 +0200
+@@ -118,7 +118,9 @@
+ #define VFS_COPYFD		(VFS_BASE + 46)
+ #define VFS_CHECKPERMS		(VFS_BASE + 47)
+ #define VFS_GETSYSINFO		(VFS_BASE + 48)
++#define VFS_EXCLUSIVE		(VFS_BASE + 49)
++#define VFS_FEXCLUSIVE		(VFS_BASE + 50)
+ 
+-#define NR_VFS_CALLS		49	/* highest number from base plus one */
++#define NR_VFS_CALLS		51	/* highest number from base plus one */
+ 
+ #endif /* !_MINIX_CALLNR_H */
+diff -rupNEZbB original/usr/src/minix/include/minix/ipc.h solution/usr/src/minix/include/minix/ipc.h
+--- original/usr/src/minix/include/minix/ipc.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/include/minix/ipc.h	2023-06-13 19:54:35.312397761 +0200
+@@ -842,6 +842,16 @@ typedef struct {
+ _ASSERT_MSG_SIZE(mess_lc_vfs_umount);
+ 
+ typedef struct {
++	int fd;
++	vir_bytes name;
++	size_t len;
++	int flags;
++
++	uint8_t padding[40];
++} mess_lc_vfs_exclusive;
++_ASSERT_MSG_SIZE(mess_lc_vfs_exclusive);
++
++typedef struct {
+ 	void		*addr;
+ 	uint8_t		padding[52];
+ } mess_lc_vm_brk;
+@@ -2121,6 +2131,7 @@ typedef struct {
+ 		mess_lc_vfs_truncate	m_lc_vfs_truncate;
+ 		mess_lc_vfs_umask	m_lc_vfs_umask;
+ 		mess_lc_vfs_umount	m_lc_vfs_umount;
++		mess_lc_vfs_exclusive	m_lc_vfs_exclusive;
+ 		mess_lc_vm_brk		m_lc_vm_brk;
+ 		mess_lc_vm_getphys	m_lc_vm_getphys;
+ 		mess_lc_vm_rusage	m_lc_vm_rusage;
+diff -rupNEZbB original/usr/src/minix/servers/vfs/const.h solution/usr/src/minix/servers/vfs/const.h
+--- original/usr/src/minix/servers/vfs/const.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/const.h	2023-06-13 19:54:35.312397761 +0200
+@@ -7,6 +7,7 @@
+ #define NR_MNTS           16 	/* # slots in mount table */
+ #define NR_VNODES       1024	/* # slots in vnode table */
+ #define NR_WTHREADS	   9	/* # slots in worker thread table */
++#define NR_EXCLUSIVE	8	/* # slots in the exclusive locking table */
+ 
+ #define NR_NONEDEVS	NR_MNTS	/* # slots in nonedev bitmap */
+ 
+diff -rupNEZbB original/usr/src/minix/servers/vfs/exclusive.c solution/usr/src/minix/servers/vfs/exclusive.c
+--- original/usr/src/minix/servers/vfs/exclusive.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/minix/servers/vfs/exclusive.c	2023-06-18 13:23:18.873205271 +0200
+@@ -0,0 +1,171 @@
++#include "fs.h"
++
++static void lock_exclusive(int exclusive_slot, uid_t uid, int fd, ino_t inode_nr, endpoint_t fs_e, dev_t dev) {
++    exclusive_files[exclusive_slot].e_uid = uid;
++    exclusive_files[exclusive_slot].e_fd = fd;
++    exclusive_files[exclusive_slot].e_inode_nr = inode_nr;
++    exclusive_files[exclusive_slot].e_fs_e = fs_e;
++    exclusive_files[exclusive_slot].e_dev = dev;
++    exclusive_files[exclusive_slot].is_slot_used = true;
++    exclusive_files[exclusive_slot].is_unlink_rename = false;
++    exclusive_files[exclusive_slot].e_pid = fp->fp_pid;
++}
++
++static int assign_free_slot(void) {
++    for (int i = 0; i < NR_EXCLUSIVE; i++) {
++        if (!exclusive_files[i].is_slot_used) {
++            return(i);
++        }
++    }
++    return(-1);
++}
++
++static bool is_file_open_by_another_user(ino_t inode_nr, endpoint_t fs_e) {
++    for (int i = 0; i < NR_PROCS; i++) {
++        if (fproc[i].fp_pid == PID_FREE) {
++            continue;
++        }
++        if (fproc[i].fp_realuid != fp->fp_realuid) {
++            for (int j = 0; j < OPEN_MAX; j++) {
++                if (fproc[i].fp_filp[j] == NULL) {
++                    continue;
++                }
++                if (fproc[i].fp_filp[j]->filp_vno->v_inode_nr == inode_nr &&
++                    fproc[i].fp_filp[j]->filp_vno->v_fs_e == fs_e) {
++                    return(true);
++                }
++            }
++        }
++    }
++    return(false);
++}
++
++static int make_exclusive_action(int fd, int flags, struct vnode *vp, bool is_valid_mode_access) {
++    uid_t uid = fp->fp_realuid;
++    ino_t inode_nr = vp->v_inode_nr;
++    endpoint_t fs_e = vp->v_fs_e;
++    dev_t dev = vp->v_dev;
++    int exclusive_slot = find_exclusive(inode_nr, fs_e);
++    int r = OK;
++
++    switch(flags) {
++        case EXCL_LOCK_NO_OTHERS:
++            /* Check if file is already locked. */
++            if (exclusive_slot != -1) {
++                r = EALREADY;
++                break;
++            }
++            if (is_file_open_by_another_user(inode_nr, fs_e)) {
++                r = EAGAIN;
++                break;
++            }
++        case EXCL_LOCK:
++            /* Check if file is already locked. */
++            if (exclusive_slot != -1) {
++                r = EALREADY;
++                break;
++            }
++            /* Check if fd corresponds to a regular file */
++            if (!S_ISREG(vp->v_mode)) {
++                r = EFTYPE;
++                break;
++            }
++            /* Check if file descriptor is open in read or write mode. */
++            if (!is_valid_mode_access) {
++                if (fd == -1) {
++                    r = EACCES;
++                } else {
++                    r = EBADF;
++                }
++                break;
++            }
++            /* Make sure exclusive files limit will not be exceeded. */
++            int free_exclusive_slot = assign_free_slot();
++            if (free_exclusive_slot == -1) {
++                r = ENOLCK;
++                break;
++            }
++            lock_exclusive(free_exclusive_slot, uid, fd, inode_nr, fs_e, dev);
++            break;
++        case EXCL_UNLOCK:
++            if (exclusive_slot == -1) {
++                r = EINVAL;
++                break;
++            }
++            if (uid != exclusive_files[exclusive_slot].e_uid) {
++                r = EPERM;
++                break;
++            }
++        case EXCL_UNLOCK_FORCE:
++            if (exclusive_slot == -1) {
++                r = EINVAL;
++                break;
++            }
++            uid_t owner = vp->v_uid;
++            if (uid != exclusive_files[exclusive_slot].e_uid && uid != owner && uid != SU_UID) {
++                r = EPERM;
++                break;
++            }
++            unlock_exclusive(exclusive_slot);
++            break;
++        default:
++            r = EINVAL;
++            break;
++    }
++    return(r);
++}
++
++static void remove_exclusive_locks(struct vnode *vp, struct vmnt *vmp) {
++    unlock_vnode(vp);
++    if (vmp) {
++        unlock_vmnt(vmp);
++    }
++    put_vnode(vp);
++}
++
++int do_exclusive(void) {
++    vir_bytes name = m_in.m_lc_vfs_exclusive.name;
++    size_t len = m_in.m_lc_vfs_exclusive.len;
++    int flags = m_in.m_lc_vfs_exclusive.flags;
++
++    struct lookup resolve;
++    struct vnode *vp;
++    struct vmnt *vmp;
++    char path[PATH_MAX];
++
++    lookup_init(&resolve, path, 0, &vmp, &vp);
++    resolve.l_vmnt_lock = VMNT_READ;
++    resolve.l_vnode_lock = VNODE_READ;
++    if (fetch_name(name, len, path) != OK) {
++        if (vmp) {
++            unlock_vmnt(vmp);
++        }
++        return(err_code);
++    }
++    if ((vp = eat_path(&resolve, fp)) == NULL) {
++        if (vmp) {
++            unlock_vmnt(vmp);
++        }
++        return(err_code);
++    }
++    bool is_valid_mode_access = (forbidden(fp, vp, R_BIT) == OK) || (forbidden(fp, vp, W_BIT) == OK);
++    int r = make_exclusive_action(-1, flags, vp, is_valid_mode_access);
++    remove_exclusive_locks(vp, vmp);
++    return(r);
++}
++
++int do_fexclusive(void) {
++    int fd = m_in.m_lc_vfs_exclusive.fd;
++    int flags = m_in.m_lc_vfs_exclusive.flags;
++
++    struct filp *fp_filp = get_filp(fd, VNODE_READ);
++
++    /* Check if file descriptor is valid. */
++    if (fp_filp == NULL) {
++        return(EBADF);
++    }
++    bool is_valid_mode_access = (fp_filp->filp_mode) & (R_BIT | W_BIT);
++    int r = make_exclusive_action(fd, flags, fp_filp->filp_vno, is_valid_mode_access);
++    unlock_filp(fp_filp);
++    return(r);
++}
+diff -rupNEZbB original/usr/src/minix/servers/vfs/exclusive.h solution/usr/src/minix/servers/vfs/exclusive.h
+--- original/usr/src/minix/servers/vfs/exclusive.h	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/minix/servers/vfs/exclusive.h	2023-06-18 11:01:12.030351051 +0200
+@@ -0,0 +1,32 @@
++#ifndef __VFS_EXCLUSIVE_H__
++#define __VFS_EXCLUSIVE_H__
++
++#include <stdbool.h>
++
++EXTERN struct exclusive {
++    uid_t e_uid;              /* id of the lock owner */
++    int e_fd;                 /* vnode fd, -1 if exclusive by path */
++    ino_t e_inode_nr;         /* inode number on its (minor) device */
++    endpoint_t e_fs_e;        /* FS process' endpoint number */
++    dev_t e_dev;              /* device number */
++    bool is_slot_used;
++    bool is_unlink_rename;    /* true if unlink or rename was executed on this file */
++    pid_t e_pid;              /* pid of the process that locked the file */
++} exclusive_files[NR_EXCLUSIVE];
++
++inline int find_exclusive(ino_t inode_nr, endpoint_t fs_e) {
++    for (int i = 0; i < NR_EXCLUSIVE; i++) {
++        if (exclusive_files[i].is_slot_used &&
++            exclusive_files[i].e_inode_nr == inode_nr &&
++            exclusive_files[i].e_fs_e == fs_e) {
++            return(i);
++        }
++    }
++    return(-1);
++}
++
++inline void unlock_exclusive(int exclusive_slot) {
++    exclusive_files[exclusive_slot].is_slot_used = false;
++}
++
++#endif // __VFS_EXCLUSIVE_H__
+diff -rupNEZbB original/usr/src/minix/servers/vfs/fs.h solution/usr/src/minix/servers/vfs/fs.h
+--- original/usr/src/minix/servers/vfs/fs.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/fs.h	2023-06-17 22:41:18.989262657 +0200
+@@ -35,5 +35,10 @@
+ #include "type.h"
+ #include "vmnt.h"
+ #include "fproc.h"
++#include "exclusive.h"
++#include "fcntl.h"
++#include "file.h"
++#include "vnode.h"
++#include "path.h"
+ 
+ #endif
+diff -rupNEZbB original/usr/src/minix/servers/vfs/link.c solution/usr/src/minix/servers/vfs/link.c
+--- original/usr/src/minix/servers/vfs/link.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/link.c	2023-06-17 22:35:49.334145006 +0200
+@@ -128,29 +128,40 @@ int do_unlink(void)
+ 	return(r);
+   }
+ 
+-  /* Also, if the sticky bit is set, only the owner of the file or a privileged
+-     user is allowed to unlink */
+-  if ((dirp->v_mode & S_ISVTX) == S_ISVTX) {
+-	/* Look up inode of file to unlink to retrieve owner */
++  /* ab417519 */
+ 	lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
+ 	stickycheck.l_vmnt_lock = VMNT_READ;
+ 	stickycheck.l_vnode_lock = VNODE_READ;
+ 	vp = advance(dirp, &stickycheck, fp);
+ 	assert(vmp2 == NULL);
+ 	if (vp != NULL) {
+-		if (vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID)
++      if (((dirp->v_mode & S_ISVTX) == S_ISVTX) && (vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID))
+ 			r = EPERM;
++      else {
++          int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e);
++          if (exclusive_pos != -1) {
++              if (fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) {
++                  r = EACCES;
++              } else if (exclusive_files[exclusive_pos].e_fd == -1) {
++                  if (vp->v_ref_count == 1) {
++                      unlock_exclusive(exclusive_pos);
++                  } else if (vp->v_ref_count > 1) {
++                      exclusive_files[exclusive_pos].is_unlink_rename = true;
++                  }
++              }
++          }
++      }
+ 		unlock_vnode(vp);
+ 		put_vnode(vp);
+-	} else
++  } else {
+ 		r = err_code;
++  }
+ 	if (r != OK) {
+ 		unlock_vnode(dirp);
+ 		unlock_vmnt(vmp);
+ 		put_vnode(dirp);
+ 		return(r);
+ 	}
+-  }
+ 
+   upgrade_vmnt_lock(vmp);
+ 
+@@ -193,29 +204,32 @@ int do_rename(void)
+   if (fetch_name(vname1, vname1_length, fullpath) != OK) return(err_code);
+   if ((old_dirp = last_dir(&resolve, fp)) == NULL) return(err_code);
+ 
+-  /* If the sticky bit is set, only the owner of the file or a privileged
+-     user is allowed to rename */
+-  if ((old_dirp->v_mode & S_ISVTX) == S_ISVTX) {
+-	/* Look up inode of file to unlink to retrieve owner */
++  /* ab417519 */
+ 	lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
+ 	stickycheck.l_vmnt_lock = VMNT_READ;
+ 	stickycheck.l_vnode_lock = VNODE_READ;
+ 	vp = advance(old_dirp, &stickycheck, fp);
+ 	assert(vmp2 == NULL);
+ 	if (vp != NULL) {
+-		if(vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID)
++      if(((old_dirp->v_mode & S_ISVTX) == S_ISVTX) && (vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID))
+ 			r = EPERM;
++      else {
++          int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e);
++          if (exclusive_pos != -1 && fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) {
++              r = EACCES;
++          }
++      }
+ 		unlock_vnode(vp);
+ 		put_vnode(vp);
+-	} else
++  } else {
+ 		r = err_code;
++  }
+ 	if (r != OK) {
+ 		unlock_vnode(old_dirp);
+ 		unlock_vmnt(oldvmp);
+ 		put_vnode(old_dirp);
+ 		return(r);
+ 	}
+-  }
+ 
+   /* Save the last component of the old name */
+   if (strlen(fullpath) >= sizeof(old_name)) {
+@@ -254,6 +268,33 @@ int do_rename(void)
+   if ((r1 = forbidden(fp, old_dirp, W_BIT|X_BIT)) != OK ||
+       (r1 = forbidden(fp, new_dirp, W_BIT|X_BIT)) != OK) r = r1;
+ 
++  /* ab417519 */
++  lookup_init(&stickycheck, resolve.l_path, PATH_RET_SYMLINK, &vmp2, &vp);
++  stickycheck.l_vmnt_lock = VMNT_READ;
++  stickycheck.l_vnode_lock = VNODE_READ;
++  vp = advance(new_dirp, &stickycheck, fp);
++  assert(vmp2 == NULL);
++  if (vp != NULL) {
++      if(((old_dirp->v_mode & S_ISVTX) == S_ISVTX) && (vp->v_uid != fp->fp_effuid && fp->fp_effuid != SU_UID))
++          r = EPERM;
++      else {
++          int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e);
++          if (exclusive_pos != -1) {
++              if (fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) {
++                  r = EACCES;
++              } else if (exclusive_files[exclusive_pos].e_fd == -1) {
++                  if (vp->v_ref_count == 1) {
++                      unlock_exclusive(exclusive_pos);
++                  } else if (vp->v_ref_count > 1) {
++                      exclusive_files[exclusive_pos].is_unlink_rename = true;
++                  }
++              }
++          }
++      }
++      unlock_vnode(vp);
++      put_vnode(vp);
++  }
++
+   if (r == OK) {
+ 	upgrade_vmnt_lock(oldvmp); /* Upgrade to exclusive access */
+ 	r = req_rename(old_dirp->v_fs_e, old_dirp->v_inode_nr, old_name,
+@@ -310,7 +351,10 @@ int do_truncate(void)
+ 	 * ensures that the file times are retained when the file size remains
+ 	 * the same, which is a POSIX requirement.
+ 	 */
+-	if (S_ISREG(vp->v_mode) && vp->v_size == length)
++    int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e); // ab417519
++    if (exclusive_pos != -1 && fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) // ab417519
++        r = EACCES;
++	else if (S_ISREG(vp->v_mode) && vp->v_size == length)
+ 		r = OK;
+ 	else
+ 		r = truncate_vnode(vp, length);
+@@ -344,8 +388,12 @@ int do_ftruncate(void)
+ 
+   vp = rfilp->filp_vno;
+ 
++  int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e); // ab417519
++
+   if (!(rfilp->filp_mode & W_BIT))
+ 	r = EBADF;
++  else if (exclusive_pos != -1 && fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) // ab417519
++    r = EACCES;
+   else if (S_ISREG(vp->v_mode) && vp->v_size == length)
+ 	/* If the file size does not change, do not make the actual call. This
+ 	 * ensures that the file times are retained when the file size remains
+diff -rupNEZbB original/usr/src/minix/servers/vfs/Makefile solution/usr/src/minix/servers/vfs/Makefile
+--- original/usr/src/minix/servers/vfs/Makefile	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/Makefile	2023-06-13 19:54:35.312397761 +0200
+@@ -7,7 +7,8 @@ SRCS=	main.c open.c read.c write.c pipe.
+ 	filedes.c stadir.c protect.c time.c \
+ 	lock.c misc.c utility.c select.c table.c \
+ 	vnode.c vmnt.c request.c \
+-	tll.c comm.c worker.c coredump.c
++	tll.c comm.c worker.c coredump.c \
++	exclusive.c
+ 
+ .if ${MKCOVERAGE} != "no"
+ SRCS+=  gcov.c
+diff -rupNEZbB original/usr/src/minix/servers/vfs/mount.c solution/usr/src/minix/servers/vfs/mount.c
+--- original/usr/src/minix/servers/vfs/mount.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/mount.c	2023-06-17 14:03:25.960543063 +0200
+@@ -506,6 +506,13 @@ int unmount(
+ 				 * we won't send any messages after the
+ 				 * unmount request */
+ 
++  /* ab417519 */
++  for (int i = 0; i < NR_EXCLUSIVE; i++) {
++      if (exclusive_files[i].is_slot_used && exclusive_files[i].e_dev == dev) {
++          unlock_exclusive(i);
++      }
++  }
++
+   /* Tell FS to unmount */
+   if ((r = req_unmount(vmp->m_fs_e)) != OK)              /* Not recoverable. */
+ 	printf("VFS: ignoring failed umount attempt FS endpoint: %d (%d)\n",
+diff -rupNEZbB original/usr/src/minix/servers/vfs/open.c solution/usr/src/minix/servers/vfs/open.c
+--- original/usr/src/minix/servers/vfs/open.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/open.c	2023-06-18 10:56:32.267088907 +0200
+@@ -131,6 +131,15 @@ int common_open(char path[PATH_MAX], int
+ 	if (vmp != NULL) unlock_vmnt(vmp);
+   }
+ 
++  /* ab417519 */
++  int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e);
++  if (exclusive_pos != -1 && fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) {
++      unlock_vnode(vp);
++      unlock_filp(filp);
++      put_vnode(vp);
++      return EACCES;
++  }
++
+   /* Claim the file descriptor and filp slot and fill them in. */
+   fp->fp_filp[scratch(fp).file.fd_nr] = filp;
+   filp->filp_count = 1;
+@@ -686,6 +695,21 @@ int fd_nr;
+ 
+   vp = rfilp->filp_vno;
+ 
++  /* ab417519 */
++  int exclusive_pos = find_exclusive(vp->v_inode_nr, vp->v_fs_e);
++  if (exclusive_pos != -1) {
++      if (exclusive_files[exclusive_pos].e_fd == fd_nr) {
++          if (rfp->fp_realuid == exclusive_files[exclusive_pos].e_uid &&
++              rfp->fp_pid == exclusive_files[exclusive_pos].e_pid) {
++              unlock_exclusive(exclusive_pos);
++          }
++      } else if (exclusive_files[exclusive_pos].e_fd == -1) {
++          if (vp->v_ref_count == 1 && exclusive_files[exclusive_pos].is_unlink_rename) {
++              unlock_exclusive(exclusive_pos);
++          }
++      }
++  }
++
+   /* first, make all future get_filp2()'s fail; otherwise
+    * we might try to close the same fd in different threads
+    */
+diff -rupNEZbB original/usr/src/minix/servers/vfs/proto.h solution/usr/src/minix/servers/vfs/proto.h
+--- original/usr/src/minix/servers/vfs/proto.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/proto.h	2023-06-13 19:54:35.312397761 +0200
+@@ -348,4 +348,9 @@ void worker_wait(void);
+ struct worker_thread *worker_suspend(void);
+ void worker_resume(struct worker_thread *org_self);
+ void worker_set_proc(struct fproc *rfp);
++
++/* exclusive.c */
++int do_exclusive(void);
++int do_fexclusive(void);
++
+ #endif
+diff -rupNEZbB original/usr/src/minix/servers/vfs/read.c solution/usr/src/minix/servers/vfs/read.c
+--- original/usr/src/minix/servers/vfs/read.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/read.c	2023-06-16 22:52:14.069640741 +0200
+@@ -111,6 +111,13 @@ int actual_read_write_peek(struct fproc
+ 	return(0);	/* so char special files need not check for 0*/
+   }
+ 
++  /* ab417519 */
++  int exclusive_pos = find_exclusive(f->filp_vno->v_inode_nr, f->filp_vno->v_fs_e);
++  if (exclusive_pos != -1 && fp->fp_realuid != exclusive_files[exclusive_pos].e_uid) {
++    unlock_filp(f);
++    return EACCES;
++  }
++
+   r = read_write(rfp, rw_flag, f, scratch(rfp).io.io_buffer,
+ 	scratch(rfp).io.io_nbytes, who_e);
+ 
+diff -rupNEZbB original/usr/src/minix/servers/vfs/table.c solution/usr/src/minix/servers/vfs/table.c
+--- original/usr/src/minix/servers/vfs/table.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/vfs/table.c	2023-06-13 19:54:35.312397761 +0200
+@@ -65,4 +65,6 @@ int (* const call_vec[NR_VFS_CALLS])(voi
+ 	CALL(VFS_COPYFD)	= do_copyfd,		/* copyfd(2) */
+ 	CALL(VFS_CHECKPERMS)	= do_checkperms,	/* checkperms(2) */
+ 	CALL(VFS_GETSYSINFO)	= do_getsysinfo,	/* getsysinfo(2) */
++	CALL(VFS_EXCLUSIVE)	= do_exclusive,		/* exclusive() */
++	CALL(VFS_FEXCLUSIVE)	= do_fexclusive,	/* fexclusive() */
+ };
+diff -rupNEZbB original/usr/src/sys/sys/fcntl.h solution/usr/src/sys/sys/fcntl.h
+--- original/usr/src/sys/sys/fcntl.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/sys/sys/fcntl.h	2023-06-13 19:54:35.316397727 +0200
+@@ -301,6 +301,13 @@ struct flock {
+ #define	AT_REMOVEDIR		0x800	/* Remove directory only */
+ #endif
+ 
++/*
++ * Constants for exclusive lock.
++ */
++#define EXCL_UNLOCK				1	/* Unlock. */
++#define EXCL_UNLOCK_FORCE		2	/* Forced unlock by privileged users. */
++#define EXCL_LOCK				4	/* Lock unconditionally. */
++#define EXCL_LOCK_NO_OTHERS		8	/* Lock if no other users have this file opened. */
+ 
+ #ifndef _KERNEL
+ #include <sys/cdefs.h>

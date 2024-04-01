@@ -1,0 +1,301 @@
+diff -rupNEZbB original/usr/include/minix/callnr.h solution/usr/include/minix/callnr.h
+--- original/usr/include/minix/callnr.h	2014-09-14 11:00:44.000000000 +0200
++++ solution/usr/include/minix/callnr.h	2023-05-08 18:36:11.429039621 +0200
+@@ -58,8 +58,9 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
++#define PM_HELLO        (PM_BASE + 48) // ab417519
+ 
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define NR_PM_CALLS		49	/* highest number from base plus one */ // ab417519
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff -rupNEZbB original/usr/include/minix/com.h solution/usr/include/minix/com.h
+--- original/usr/include/minix/com.h	2014-09-14 11:00:44.000000000 +0200
++++ solution/usr/include/minix/com.h	2023-04-27 08:06:40.688956342 +0200
+@@ -753,6 +753,11 @@
+ #define IPC_SEMCTL	(IPC_BASE+6)
+ #define IPC_SEMOP	(IPC_BASE+7)
+ 
++// ab417519
++// Assign a new number for our system call
++#define IPC_PRINTMESSAGE (IPC_BASE+8)
++#define IPC_STORAGE (IPC_BASE+9)
++
+ /*===========================================================================*
+  *                Messages for Scheduling				     *
+  *===========================================================================*/
+diff -rupNEZbB original/usr/include/unistd.h solution/usr/include/unistd.h
+--- original/usr/include/unistd.h	2014-09-14 11:00:43.000000000 +0200
++++ solution/usr/include/unistd.h	2023-05-08 19:35:23.527612725 +0200
+@@ -144,6 +144,11 @@ __aconst char *ttyname(int);
+ int	 unlink(const char *);
+ ssize_t	 write(int, const void *, size_t);
+ 
++// ab417519
++// Add library function header
++int printmessage(void);
++int storage(int);
++int pm_hello(void);
+ 
+ /*
+  * IEEE Std 1003.2-92, adopted in X/Open Portability Guide Issue 4 and later
+diff -rupNEZbB original/usr/src/include/unistd.h solution/usr/src/include/unistd.h
+--- original/usr/src/include/unistd.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/include/unistd.h	2023-05-08 19:34:07.054792849 +0200
+@@ -144,6 +144,11 @@ __aconst char *ttyname(int);
+ int	 unlink(const char *);
+ ssize_t	 write(int, const void *, size_t);
+ 
++// ab417519
++// Add library function header
++int printmessage(void);
++int storage(int);
++int pm_hello(void);
+ 
+ /*
+  * IEEE Std 1003.2-92, adopted in X/Open Portability Guide Issue 4 and later
+diff -rupNEZbB original/usr/src/lib/libc/misc/Makefile.inc solution/usr/src/lib/libc/misc/Makefile.inc
+--- original/usr/src/lib/libc/misc/Makefile.inc	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/lib/libc/misc/Makefile.inc	2023-05-08 19:39:39.794575046 +0200
+@@ -7,4 +7,4 @@
+ SRCS+=	initfini.c
+ 
+ # for -fstack-protector
+-SRCS+=	stack_protector.c
++SRCS+=	stack_protector.c printmessage.c storage.c pm_hello.c # ab417519
+diff -rupNEZbB original/usr/src/lib/libc/misc/pm_hello.c solution/usr/src/lib/libc/misc/pm_hello.c
+--- original/usr/src/lib/libc/misc/pm_hello.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/lib/libc/misc/pm_hello.c	2023-05-08 19:42:24.888610794 +0200
+@@ -0,0 +1,21 @@
++#include <lib.h>
++#include <minix/rs.h>
++#include <string.h>
++
++int get_pm_endpt(endpoint_t *pt)
++{
++    return minix_rs_lookup("pm", pt);
++}
++
++int pm_hello(void)
++{
++    endpoint_t pm_pt;
++    message m;
++    memset(&m, 0, sizeof(m));
++    if (get_pm_endpt(&pm_pt) != 0)
++    {
++        errno = ENOSYS;
++        return -1;
++    }
++    return (_syscall(pm_pt, PM_HELLO, &m));
++}
+diff -rupNEZbB original/usr/src/lib/libc/misc/printmessage.c solution/usr/src/lib/libc/misc/printmessage.c
+--- original/usr/src/lib/libc/misc/printmessage.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/lib/libc/misc/printmessage.c	2023-04-27 08:55:30.568294779 +0200
+@@ -0,0 +1,20 @@
++//
++// Created by alek on 26.04.23.
++//
++
++// ab417519
++
++#include <lib.h>
++#include <minix/rs.h>
++
++int printmessage(void)
++{
++    endpoint_t ipc_pt;
++    message m;
++    if (minix_rs_lookup("ipc", &ipc_pt) != 0)
++    {
++        errno = ENOSYS;
++        return -1;
++    }
++    return (_syscall(ipc_pt, IPC_PRINTMESSAGE, &m));
++}
+diff -rupNEZbB original/usr/src/lib/libc/misc/storage.c solution/usr/src/lib/libc/misc/storage.c
+--- original/usr/src/lib/libc/misc/storage.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/lib/libc/misc/storage.c	2023-04-27 09:05:02.462142877 +0200
+@@ -0,0 +1,19 @@
++//
++// Created by alek on 27.04.23.
++//
++// ab417519
++
++#include <lib.h>
++#include <minix/rs.h>
++#include <stdio.h>
++
++int storage(int x)
++{
++    message m;
++    endpoint_t ipc_ep;
++    minix_rs_lookup("ipc", &ipc_ep);
++    m.m1_i1 = x;
++    _syscall(ipc_ep, IPC_STORAGE, &m);
++    printf("syscall return: %d\n", m.m1_i1);
++    return m.m1_i1;
++}
+diff -rupNEZbB original/usr/src/minix/include/minix/callnr.h solution/usr/src/minix/include/minix/callnr.h
+--- original/usr/src/minix/include/minix/callnr.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/include/minix/callnr.h	2023-05-08 18:36:11.417039381 +0200
+@@ -58,8 +58,9 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
++#define PM_HELLO        (PM_BASE + 48) // ab417519
+ 
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define NR_PM_CALLS		49 /* highest number from base plus one */ // ab417519
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff -rupNEZbB original/usr/src/minix/include/minix/com.h solution/usr/src/minix/include/minix/com.h
+--- original/usr/src/minix/include/minix/com.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/include/minix/com.h	2023-04-27 08:06:40.668956384 +0200
+@@ -753,6 +753,11 @@
+ #define IPC_SEMCTL	(IPC_BASE+6)
+ #define IPC_SEMOP	(IPC_BASE+7)
+ 
++// ab417519
++// Assign a new number for our system call
++#define IPC_PRINTMESSAGE (IPC_BASE+8)
++#define IPC_STORAGE (IPC_BASE+9)
++
+ /*===========================================================================*
+  *                Messages for Scheduling				     *
+  *===========================================================================*/
+diff -rupNEZbB original/usr/src/minix/servers/ipc/do_printmessage.c solution/usr/src/minix/servers/ipc/do_printmessage.c
+--- original/usr/src/minix/servers/ipc/do_printmessage.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/minix/servers/ipc/do_printmessage.c	2023-04-26 21:34:33.191447298 +0200
+@@ -0,0 +1,14 @@
++//
++// Created by alek on 26.04.23.
++//
++
++// ab417519
++// Source code of a function that handles our system call
++#include "inc.h"
++#include <stdio.h>
++
++int do_printmessage(message *m)
++{
++    printf("Hello world!\n");
++    return OK;
++}
+diff -rupNEZbB original/usr/src/minix/servers/ipc/do_storage.c solution/usr/src/minix/servers/ipc/do_storage.c
+--- original/usr/src/minix/servers/ipc/do_storage.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/minix/servers/ipc/do_storage.c	2023-04-27 09:05:02.474142660 +0200
+@@ -0,0 +1,19 @@
++//
++// Created by alek on 27.04.23.
++//
++
++// ab417519
++// Source code of a function that handles our system call
++#include "inc.h"
++#include <stdio.h>
++
++int do_storage(message *m)
++{
++    static int n = 0;
++    int old;
++    old = n;
++    n = m->m1_i1;
++    printf("Syscall storage called: old = %d, new = %d\n", old, n);
++    m->m1_i1 = old;
++    return OK;
++}
+diff -rupNEZbB original/usr/src/minix/servers/ipc/inc.h solution/usr/src/minix/servers/ipc/inc.h
+--- original/usr/src/minix/servers/ipc/inc.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/ipc/inc.h	2023-04-27 08:20:09.000920874 +0200
+@@ -42,6 +42,11 @@ int is_sem_nil(void);
+ int is_shm_nil(void);
+ void sem_process_vm_notify(void);
+ 
++// ab417519
++// Add header for a function that handles our system call
++int do_printmessage(message *);
++int do_storage(message *);
++
+ EXTERN int identifier;
+ EXTERN endpoint_t who_e;
+ EXTERN int call_type;
+diff -rupNEZbB original/usr/src/minix/servers/ipc/main.c solution/usr/src/minix/servers/ipc/main.c
+--- original/usr/src/minix/servers/ipc/main.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/ipc/main.c	2023-04-27 08:11:20.883898499 +0200
+@@ -16,6 +16,8 @@ static struct {
+ 	{ IPC_SEMGET,	do_semget,	0 },
+ 	{ IPC_SEMCTL,	do_semctl,	0 },
+ 	{ IPC_SEMOP,	do_semop,	1 },
++    {IPC_PRINTMESSAGE, do_printmessage, 0}, // ab417519
++    {IPC_STORAGE, do_storage, 0}, // ab417519
+ };
+ 
+ #define SIZE(a) (sizeof(a)/sizeof(a[0]))
+diff -rupNEZbB original/usr/src/minix/servers/ipc/Makefile solution/usr/src/minix/servers/ipc/Makefile
+--- original/usr/src/minix/servers/ipc/Makefile	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/ipc/Makefile	2023-04-27 08:20:08.976920949 +0200
+@@ -1,6 +1,6 @@
+ # Makefile for IPC server
+ PROG=	ipc
+-SRCS=	main.c utility.c shm.c sem.c
++SRCS=	main.c utility.c shm.c sem.c do_printmessage.c do_storage.c # ab417519
+ 
+ DPADD+=	${LIBSYS}
+ LDADD+=	-lsys
+diff -rupNEZbB original/usr/src/minix/servers/pm/do_pm_hello.c solution/usr/src/minix/servers/pm/do_pm_hello.c
+--- original/usr/src/minix/servers/pm/do_pm_hello.c	1970-01-01 01:00:00.000000000 +0100
++++ solution/usr/src/minix/servers/pm/do_pm_hello.c	2023-05-08 19:30:24.900650673 +0200
+@@ -0,0 +1,8 @@
++// ab417519
++#include <stdio.h>
++#include "proto.h"
++
++int do_pm_hello(void) {
++    printf("Hello world from server PM!\n");
++    return 0;
++}
+diff -rupNEZbB original/usr/src/minix/servers/pm/Makefile solution/usr/src/minix/servers/pm/Makefile
+--- original/usr/src/minix/servers/pm/Makefile	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/pm/Makefile	2023-05-08 19:30:24.916650812 +0200
+@@ -4,7 +4,7 @@
+ PROG=	pm
+ SRCS=	main.c forkexit.c exec.c time.c alarm.c \
+ 	signal.c utility.c table.c trace.c getset.c misc.c \
+-	profile.c mcontext.c schedule.c
++	profile.c mcontext.c schedule.c do_pm_hello.c \
+ 
+ DPADD+=	${LIBSYS} ${LIBTIMERS}
+ LDADD+=	-lsys -ltimers
+diff -rupNEZbB original/usr/src/minix/servers/pm/proto.h solution/usr/src/minix/servers/pm/proto.h
+--- original/usr/src/minix/servers/pm/proto.h	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/pm/proto.h	2023-05-08 19:30:24.936650984 +0200
+@@ -3,6 +3,7 @@
+ struct mproc;
+ 
+ #include <minix/timers.h>
++#include <minix/ipc.h> // ab417519
+ 
+ /* alarm.c */
+ int do_itimer(void);
+@@ -89,3 +90,6 @@ struct mproc *find_proc(pid_t lpid);
+ int nice_to_priority(int nice, unsigned *new_q);
+ int pm_isokendpt(int ep, int *proc);
+ void tell_vfs(struct mproc *rmp, message *m_ptr);
++
++/* ab417519 */
++int do_pm_hello(void);
+diff -rupNEZbB original/usr/src/minix/servers/pm/table.c solution/usr/src/minix/servers/pm/table.c
+--- original/usr/src/minix/servers/pm/table.c	2014-09-13 23:56:50.000000000 +0200
++++ solution/usr/src/minix/servers/pm/table.c	2023-05-08 19:30:24.924650880 +0200
+@@ -58,5 +58,6 @@ int (* const call_vec[NR_PM_CALLS])(void
+ 	CALL(PM_EXEC_RESTART)	= do_execrestart,
+ 	CALL(PM_GETEPINFO)	= do_getepinfo,		/* getepinfo(2) */
+ 	CALL(PM_GETPROCNR)	= do_getprocnr,		/* getprocnr(2) */
+-	CALL(PM_GETSYSINFO)	= do_getsysinfo		/* getsysinfo(2) */
++	CALL(PM_GETSYSINFO)	= do_getsysinfo,		/* getsysinfo(2) */
++    CALL(PM_HELLO)      = do_pm_hello,   /* hello(2) */
+ };
